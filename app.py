@@ -1,22 +1,42 @@
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
-import re
 import json
 import os
 import glob
 
-def process_movies():
+headers = {
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "referer": "https://speedostream1.com/"
+}
 
+CACHE_FILE = 'iframe_cache.json'
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_cache(cache_data):
+    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cache_data, f, indent=2)
+
+def process_movies():
     input_files = glob.glob('input*.json')
 
     if not input_files:
-        print("Error: No input files found (e.g., input.json, input1.json)!")
+        print("Error: No input files found!")
         return
 
-    scraper = cloudscraper.create_scraper()
+    session = requests.Session()
+    session.headers.update(headers)
+    
+    iframe_cache = load_cache()
 
     for file_path in input_files:
-      
         output_file = file_path.replace('input', 'output')
         
         print(f"\n--- Processing: {file_path} to {output_file} ---")
@@ -35,29 +55,62 @@ def process_movies():
             watch_url = movie.get('links', {}).get('watch')
             print(f"Fetching: {title}")
 
+            iframe_src = None
+
             try:
-                resp = scraper.get(watch_url, timeout=20)
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                iframe = soup.find('iframe')
-                
-                if iframe and 'src' in iframe.attrs:
-                    iframe_src = iframe['src']
-                    iframe_res = scraper.get(iframe_src, headers={'Referer': watch_url}, timeout=20)
+                resp = session.get(watch_url, timeout=20)
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.text, 'html.parser')
+                    iframe = soup.find('iframe')
                     
-           
-                    m3u8_match = re.search(r'file\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"', iframe_res.text)
+                    if iframe and 'src' in iframe.attrs:
+                        iframe_src = iframe['src']
+                        iframe_cache[watch_url] = iframe_src
+                        save_cache(iframe_cache)
+            except Exception as e:
+                print(f"Warning: watch_url failed for {title} - {e}")
+
+            if not iframe_src:
+                if watch_url in iframe_cache:
+                    print(f"-> Using CACHED iframe for {title}...")
+                    iframe_src = iframe_cache[watch_url]
+                else:
+                    print(f"-> Failed! No live response and no cache found for {title}.")
+                    continue 
+
+            if iframe_src:
+                try:
+                    php_hook_url = "https://allinonedev.top/hook.php" 
                     
-                    if m3u8_match:
+                    params = {
+                        "url": iframe_src,
+                        "referer": "https://speedostream1.com/"
+                    }
+                    
+                    print(f"-> Calling PHP Hook for {title}...")
+                    hook_res = session.get(php_hook_url, params=params, timeout=30)
+                    
+                    try:
+                        hook_data = hook_res.json()
+                    except ValueError:
+                        print(f"-> Error: Hook returned invalid JSON. Response snippet: {hook_res.text[:100]}")
+                        continue
+                    
+                    if hook_data.get("success"):
+                        m3u8_url = hook_data.get("m3u8")
                         extracted_items.append({
                             "id": title,
                             "title": title,
                             "poster": movie.get('thumbnail'),
-                            "stream_url": m3u8_match.group(1),
+                            "stream_url": m3u8_url,
                             "headers": {"Referer": "https://speedostream1.com/"}
                         })
-            except Exception as e:
-                print(f"Error processing {title}: {e}")
-
+                        print(f"-> Success! .")
+                    else:
+                        print(f"-> PHP Hook failed for {title}. Error: {hook_data.get('error')}")
+                        
+                except Exception as e:
+                    print(f"Error calling PHP Hook for {title}: {e}")
 
         if extracted_items:
             final_output = {
